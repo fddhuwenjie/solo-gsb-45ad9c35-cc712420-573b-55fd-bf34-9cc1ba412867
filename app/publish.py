@@ -30,6 +30,53 @@ def _load_current_pages(conn: sqlite3.Connection, revision: int) -> dict[str, st
     return {row["path"]: row["content"] for row in rows}
 
 
+def apply_changes(pages: dict[str, str], changes: list[dict[str, str]]) -> dict[str, str]:
+    """按数组顺序在内存快照上试用整批改动，返回最终页面集合（不写库）。
+
+    ``op`` 为 ``upsert``（别名 ``put``）或 ``delete``；未知操作抛
+    :class:`PublishValidationError`。
+    """
+    pages = dict(pages)
+    for change in changes:
+        op = change["op"]
+        path = change["path"]
+        if op in ("upsert", "put"):
+            pages[path] = change["content"]
+        elif op == "delete":
+            pages.pop(path, None)
+        else:  # pragma: no cover - 入口处已枚举校验
+            raise PublishValidationError(
+                [{"source": path, "target": "", "reason": f"unknown operation: {op}"}]
+            )
+    return pages
+
+
+def check_entry_page(pages: dict[str, str], current_revision: int) -> None:
+    """入口页规则：首次发布必须包含 /index.html；此后不得删除入口。"""
+    if current_revision == 0:
+        if INDEX not in pages:
+            raise PublishValidationError(
+                [{"source": "", "target": INDEX, "reason": "first publish must include /index.html"}]
+            )
+    elif INDEX not in pages:
+        raise PublishValidationError(
+            [{"source": "", "target": INDEX, "reason": "entry page /index.html must not be deleted"}]
+        )
+
+
+def _write_new_revision(
+    conn: sqlite3.Connection, current: int, pages: dict[str, str]
+) -> int:
+    """写入新修订完整快照并推进修订号（调用方负责事务边界）。"""
+    new_revision = current + 1
+    conn.executemany(
+        "INSERT INTO pages (revision, path, content) VALUES (?, ?, ?)",
+        [(new_revision, path, content) for path, content in sorted(pages.items())],
+    )
+    conn.execute("UPDATE meta SET current_revision = ? WHERE id = 1", (new_revision,))
+    return new_revision
+
+
 def publish(
     conn: sqlite3.Connection,
     expected_revision: int,
@@ -52,29 +99,10 @@ def publish(
             raise PublishConflict(current)
 
         # 1) 在已发布页面上试用整批改动，得到最终页面集合（不写库）。
-        pages = _load_current_pages(conn, current)
-        for change in changes:
-            op = change["op"]
-            path = change["path"]
-            if op in ("upsert", "put"):
-                pages[path] = change["content"]
-            elif op == "delete":
-                pages.pop(path, None)
-            else:  # pragma: no cover - 入口处已枚举校验
-                raise PublishValidationError(
-                    [{"source": path, "target": "", "reason": f"unknown operation: {op}"}]
-                )
+        pages = apply_changes(_load_current_pages(conn, current), changes)
 
         # 2) 入口页规则：首次发布必须包含 /index.html；此后不得删除入口。
-        if current == 0:
-            if INDEX not in pages:
-                raise PublishValidationError(
-                    [{"source": "", "target": INDEX, "reason": "first publish must include /index.html"}]
-                )
-        elif INDEX not in pages:
-            raise PublishValidationError(
-                [{"source": "", "target": INDEX, "reason": "entry page /index.html must not be deleted"}]
-            )
+        check_entry_page(pages, current)
 
         # 3) 核对最终所有页面的站内 href（相对、绝对、#片段；查询参数不影响目标）。
         link_errors = check_links(pages)
@@ -82,12 +110,7 @@ def publish(
             raise PublishValidationError(link_errors)
 
         # 4) 全部通过：写入新修订快照并推进修订号（仍在同一事务内）。
-        new_revision = current + 1
-        conn.executemany(
-            "INSERT INTO pages (revision, path, content) VALUES (?, ?, ?)",
-            [(new_revision, path, content) for path, content in sorted(pages.items())],
-        )
-        conn.execute("UPDATE meta SET current_revision = ? WHERE id = 1", (new_revision,))
+        new_revision = _write_new_revision(conn, current, pages)
         conn.commit()
         return new_revision
     except Exception:

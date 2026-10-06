@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from . import db
+from .merge import MergeBaselineNotFound, MergeConflict, merge
 from .publish import PublishConflict, PublishValidationError, publish
 from .relocate import relocate
 
@@ -64,6 +65,13 @@ class Change(BaseModel):
 
 class PublishRequest(BaseModel):
     expected_revision: int = Field(ge=0, description="客户端预期的当前修订号，实现乐观锁")
+    changes: list[Change] = Field(default_factory=list)
+
+
+class MergeRequest(BaseModel):
+    """并行合入：基于历史基线修订，把沿用发布接口格式的页面变更合入当前快照。"""
+
+    base_revision: int = Field(ge=0, description="本端改动所基于的历史修订号（0 为空基线）")
     changes: list[Change] = Field(default_factory=list)
 
 
@@ -137,6 +145,44 @@ def publish_endpoint(req: PublishRequest):
                 "detail": "revision conflict",
                 "expected": req.expected_revision,
                 "current": exc.current_revision,
+            },
+        )
+    except PublishValidationError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "validation failed", "errors": exc.errors},
+        )
+    finally:
+        conn.close()
+
+
+@app.post("/merge")
+def merge_endpoint(req: MergeRequest):
+    """基于历史基线修订的并行变更合入。比对、合入、校验与提交在同一 SQLite 写事务内完成。"""
+    conn = db.connect()
+    try:
+        new_revision = merge(
+            conn,
+            base_revision=req.base_revision,
+            changes=[c.model_dump() for c in req.changes],
+        )
+        return {"revision": new_revision, "merged": True, "base_revision": req.base_revision}
+    except MergeConflict as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": "merge conflict",
+                "base_revision": req.base_revision,
+                "current": exc.current_revision,
+                "conflicts": exc.conflicts,
+            },
+        )
+    except MergeBaselineNotFound as exc:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "detail": "base revision not found",
+                "base_revision": exc.base_revision,
             },
         )
     except PublishValidationError as exc:

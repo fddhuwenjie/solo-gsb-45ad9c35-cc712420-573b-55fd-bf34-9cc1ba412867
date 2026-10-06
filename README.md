@@ -54,6 +54,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000   # 首次启动自动建表
 | `GET /pages` | 当前修订的完整页面集合 `{"revision":n,"pages":{路径:内容}}` |
 | `GET /pages?revision=N` | 读取第 N 次发布的完整集合；不存在返回 404 |
 | `POST /publish` | 批量发布，请求体 `{"expected_revision":n,"changes":[...]}` |
+| `POST /merge` | 基于历史基线的并行变更合入，请求体 `{"base_revision":n,"changes":[...]}` |
 | `POST /relocate` | 页面搬迁，请求体 `{"expected_revision":n,"old_path":"/a.html","new_path":"/b.html"}` |
 
 ## 页面搬迁（`POST /relocate`）
@@ -94,6 +95,71 @@ curl -s -X POST http://localhost:8000/relocate \
 curl -s -X POST http://localhost:8000/relocate \
   -H 'Content-Type: application/json' \
   -d '{"expected_revision":1,"old_path":"/about.html","new_path":"/about2.html"}'
+```
+
+## 并行变更合入（`POST /merge`）
+
+同一文档包的不同客户端可能从**同一个旧修订分别改动**。`/merge` 接收**基线修订号**
+`base_revision` 与沿用发布接口格式的页面变更（`changes` 中同样是 `upsert`/`put`/`delete`），
+把本端改动合入当前快照：
+
+- **即使基线已过期**，也在**同一个 SQLite 写事务**内逐个比对本批涉及路径在
+  **基线快照与当前快照**中的存在性与正文：
+  - 基线有、当前无 → `path deleted by another change`；
+  - 基线无、当前有 → `path added by another change`；
+  - 两边都有但正文不同 → `path modified by another change`；
+  - 两边都无，或正文完全相同 → 未被其他人改动，允许合入。
+- 任一路径已变化即返回 **409**，响应给出当前修订号 `current` 与冲突路径列表
+  `conflicts`（按路径排序），**整批不写入**，内容与修订号均不变。
+- 无同路径冲突时，**按提交顺序**把变更应用于**当前快照**：其他人新增或修改、
+  而本批未涉及的页面原样保留。随后沿用入口页规则与整包站内链接校验——
+  若其他页面的并行改动使最终链接失效（例如别人删了某页、本端新页仍链接它），
+  返回 **422**，逐项列出 `source`（来源页面）与 `target`（错误目标），
+  内容及修订号同样不变。
+- 全部通过才生成**一个新修订**（当前修订号 + 1），写入完整快照；
+  其他人新增的页面与原有历史快照（含基线）都保留，可用 `GET /pages?revision=N` 读取。
+- **基线修订不存在返回 404**（`0` 始终有效，表示空基线；未来修订号视为不存在）。
+- 成功返回 `{"revision":n,"merged":true,"base_revision":n}`。
+- 既有 `POST /publish` 对过期 `expected_revision` 的 **409** 行为与
+  `POST /relocate` 保持不变，仍可正常使用。
+
+```bash
+# 假设当前已有 revision 1：/index.html 与 /about.html。
+# 其他人先发布了 revision 2：新增 /news.html 并替换 /index.html 加上新闻链接。
+
+# 本端仍基于过期基线 1，只改动未被触碰的 /about.html -> 200，revision -> 3；
+# 其他人新增的 /news.html 与其对 /index.html 的改动原样保留
+curl -s -X POST http://localhost:8000/merge \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "base_revision": 1,
+    "changes": [
+      {"op":"upsert","path":"/about.html",
+       "content":"<a href=\"/#top\">关于（更新）</a> <a href=\"/news.html\">新闻</a>"}
+    ]
+  }'
+# {"revision":3,"merged":true,"base_revision":1}
+
+# 本端基于基线 1 改动已被别人修改的 /index.html -> 409，列出冲突路径与当前修订号
+curl -s -X POST http://localhost:8000/merge \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision":1,"changes":[{"op":"upsert","path":"/index.html","content":"<h1>旧视图</h1>"}]}'
+# {"detail":"merge conflict","base_revision":1,"current":3,
+#  "conflicts":[{"path":"/index.html","reason":"path modified by another change"}]}
+
+# 基线修订不存在 -> 404
+curl -s -X POST http://localhost:8000/merge \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision":99,"changes":[]}'
+# {"detail":"base revision not found","base_revision":99}
+
+# 其他人随后删除了 /news.html；本端基于旧基线新增仍链接它的页面
+# -> 422，列出来源 /mine.html 与错误目标 /news.html，内容及修订号不变
+curl -s -X POST http://localhost:8000/merge \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision":3,"changes":[{"op":"upsert","path":"/mine.html","content":"<a href=\"/news.html\">新闻已下线</a>"}]}'
+# {"detail":"validation failed","errors":[
+#   {"source":"/mine.html","target":"/news.html","reason":"target page not found"}]}
 ```
 
 ## 可执行的 HTTP 调用示例
@@ -155,10 +221,11 @@ curl -s "http://localhost:8000/pages?revision=1"
 app/
   db.py         # SQLite 连接、建表、修订号元数据
   linkcheck.py  # href 解析（相对/绝对/#片段/查询串/越界）与整批链接校验
-  publish.py    # 单写事务：试用整批改动 -> 校验 -> 提交；冲突/校验错误
+  publish.py    # 单写事务：试用整批改动 -> 校验 -> 提交；冲突/校验错误（/merge 复用其试用与入口页校验）
+  merge.py      # 单写事务：基线-当前路径比对 -> 并行合入 -> 整包校验 -> 新修订
   relocate.py   # 单写事务：页面搬迁、站内 href 改写（沿用 linkcheck）、整包校验、新修订
-  main.py       # FastAPI 路由与请求模型（/publish 与 /relocate）
-tests/          # pytest 端到端 + 链接解析/搬迁改写单测
+  main.py       # FastAPI 路由与请求模型（/publish、/merge 与 /relocate）
+tests/          # pytest 端到端 + 链接解析/搬迁改写/并行合入单测
 Dockerfile
 docker-compose.yml
 entrypoint.sh   # 启动时初始化数据库再拉起 uvicorn

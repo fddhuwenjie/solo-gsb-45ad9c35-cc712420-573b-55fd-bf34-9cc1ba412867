@@ -11,6 +11,11 @@ post_publish() {
     -H 'Content-Type: application/json' -d "$1"
 }
 
+post_merge() {
+  curl -sS -w '\n  -> HTTP %{http_code}\n' -X POST "$BASE/merge" \
+    -H 'Content-Type: application/json' -d "$1"
+}
+
 echo "== 健康检查"
 curl -sS "$BASE/health"; echo
 
@@ -44,3 +49,41 @@ curl -sS "$BASE/pages"; echo
 
 echo "== 7) 读取历史 revision=1 的完整集合"
 curl -sS "$BASE/pages?revision=1"; echo
+
+echo "== 并行合入：基线仍是 revision 2（当前也是 2），先看本端视图"
+
+echo "== 8) 其他人并行发布 revision 3：新增 /news.html 并替换 /index.html 加上新闻链接（预期 200，revision=3）"
+post_publish '{"expected_revision":2,"changes":[
+  {"op":"upsert","path":"/index.html","content":"<h1 id=\"top\">首页</h1> <a href=\"/docs/\">文档目录</a> <a href=\"/news.html\">新闻</a>"},
+  {"op":"upsert","path":"/news.html","content":"<a href=\"/#top\">回到首页</a>"}
+]}'
+
+echo "== 9) 并行合入：本端基于过期基线 2，只改未被触碰的 /docs/index.html（预期 200，revision=4，/news.html 原样保留）"
+post_merge '{"base_revision":2,"changes":[
+  {"op":"upsert","path":"/docs/index.html","content":"<a href=\"../index.html?x=1#top\">文档目录（本端更新）</a>"}
+]}'
+
+echo "== 10) 并行合入冲突：本端仍基于基线 2 改已被别人修改的 /index.html（预期 409，列出冲突路径与当前修订号，整批不写入）"
+post_merge '{"base_revision":2,"changes":[
+  {"op":"upsert","path":"/index.html","content":"<h1>本端旧视图</h1>"}
+]}'
+
+echo "== 11) 基线修订不存在（预期 404）"
+post_merge '{"base_revision":99,"changes":[]}'
+
+echo "== 12) 其他人从 revision 4 发布 revision 5：删除 /news.html 并清掉引用；本端基于旧基线 4 新增仍链接它的页面（预期 422，列出来源与错误目标，内容及修订号不变）"
+post_publish '{"expected_revision":4,"changes":[
+  {"op":"upsert","path":"/index.html","content":"<h1 id=\"top\">首页</h1> <a href=\"/docs/\">文档目录</a>"},
+  {"op":"delete","path":"/news.html"}
+]}'
+post_merge '{"base_revision":4,"changes":[
+  {"op":"upsert","path":"/mine.html","content":"<a href=\"/news.html\">新闻已被别人删除</a>"}
+]}'
+
+echo "== 13) 既有接口不受影响：/publish 过期 expected_revision 仍为 409"
+post_publish '{"expected_revision":1,"changes":[]}'
+
+echo "== 当前修订号与最终页面集合"
+curl -sS "$BASE/revision"; echo
+curl -sS "$BASE/pages"; echo
+

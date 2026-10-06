@@ -44,6 +44,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000   # 首次启动自动建表
   与 `reason`（`target page not found` / `target anchor not found` /
   `path escapes site root`）。
 - 校验与发布在同一个 `BEGIN IMMEDIATE` 写事务中完成，读接口永远只读到完整提交的快照。
+- **并行合入**：`/merge` 用 `base_revision`（历史基线）代替 `expected_revision`，
+  允许基线过期——只要变更涉及的路径自基线以来未被他人改动即可合入，详见下文。
 
 ## API
 
@@ -54,7 +56,88 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000   # 首次启动自动建表
 | `GET /pages` | 当前修订的完整页面集合 `{"revision":n,"pages":{路径:内容}}` |
 | `GET /pages?revision=N` | 读取第 N 次发布的完整集合；不存在返回 404 |
 | `POST /publish` | 批量发布，请求体 `{"expected_revision":n,"changes":[...]}` |
+| `POST /merge` | 并行合入，请求体 `{"base_revision":n,"changes":[...]}` |
 | `POST /relocate` | 页面搬迁，请求体 `{"expected_revision":n,"old_path":"/a.html","new_path":"/b.html"}` |
+
+## 并行变更合入（`POST /merge`）
+
+同一文档包的页面可能被不同客户端从旧修订分别改动。`/merge` 接收**基线修订号**
+（`base_revision`，客户端改动所基于的历史修订）和与 `/publish` 相同格式的整批
+`changes`，在**同一个 SQLite 写事务**内完成三方比对与合入：
+
+- **逐路径比对**：即使基线已过期，也比对变更涉及的每条路径在基线快照与当前快照中的
+  存在性与正文。任一路径已被他人并行改动（`modified since baseline` /
+  `deleted since baseline` / `created since baseline`）即返回 `409`，
+  列出冲突路径与当前修订号，**整批不写入**；
+- **无同路径冲突则合入**：按提交顺序把变更应用于**当前快照**（他人新增的页面自然
+  保留），沿用入口页规则与整包站内链接校验；若他人的并行改动使最终链接失效，
+  按 `422` 列出来源与错误目标，内容与修订号均不变；
+- **全部通过才生成一个新修订**，历史修订快照全部保留，仍可通过
+  `GET /pages?revision=N` 读取；
+- 基线不存在（大于当前修订号）返回 `404`；基线等于当前修订号时行为与 `/publish`
+  一致，`/publish` 与 `/relocate` 的既有行为不受影响。
+
+```bash
+# 场景：客户端 A、B 都基于 revision 1 改动同一文档包。
+# 0) 准备：首次发布（revision -> 1），/index.html 含锚点 top 并引用 /about.html
+curl -s -X POST http://localhost:8000/publish \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":0,"changes":[
+        {"op":"upsert","path":"/index.html",
+         "content":"<h1 id=\"top\">首页</h1><a href=\"/about.html\">关于</a>"},
+        {"op":"upsert","path":"/about.html","content":"<a href=\"/#top\">回到锚点</a>"}
+      ]}'
+
+# 1) A 先发布（改写 /about.html），revision -> 2
+curl -s -X POST http://localhost:8000/publish \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":1,"changes":[
+        {"op":"upsert","path":"/about.html","content":"<a href=\"/#top\">home v2</a>"}
+      ]}'
+
+# 2) B 携带过期的 base_revision=1 合入新页面：与 A 没碰同一路径 -> 200，
+#    生成一个新修订，A 改写的 /about.html 原样保留
+curl -s -X POST http://localhost:8000/merge \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision":1,"changes":[
+        {"op":"upsert","path":"/mine.html","content":"<a href=\"/index.html\">home</a>"}
+      ]}'
+# {"revision":3,"merged":true}
+
+# 3) B 再次基于 revision 1 合入，但触碰了 A 已改写的 /about.html
+#    -> 409，列出冲突路径与当前修订号，整批不写入
+curl -s -X POST http://localhost:8000/merge \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision":1,"changes":[
+        {"op":"upsert","path":"/about.html","content":"<p>my about</p>"}
+      ]}'
+# {"detail":"merge conflict","base_revision":1,"current":3,
+#  "conflicts":[{"path":"/about.html","reason":"modified since baseline"}]}
+
+# 4) A 删除 /about.html 并同步去掉 index 里的链接（revision -> 4）
+curl -s -X POST http://localhost:8000/publish \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":3,"changes":[
+        {"op":"upsert","path":"/index.html","content":"<h1 id=\"top\">首页</h1>"},
+        {"op":"delete","path":"/about.html"}
+      ]}'
+
+# 5) B 基于 revision 3 新增指向 /about.html 的页面：路径本身无冲突，
+#    但 A 的并行删除使最终链接失效 -> 422，列出来源与错误目标，内容与修订号不变
+curl -s -X POST http://localhost:8000/merge \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision":3,"changes":[
+        {"op":"upsert","path":"/newcomer.html","content":"<a href=\"/about.html\">about</a>"}
+      ]}'
+# {"detail":"validation failed","errors":[{"source":"/newcomer.html",
+#  "target":"/about.html","reason":"target page not found"}]}
+
+# 6) 不存在的基线 -> 404
+curl -s -X POST http://localhost:8000/merge \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision":99,"changes":[]}'
+# {"detail":"base revision not found","base_revision":99}
+```
 
 ## 页面搬迁（`POST /relocate`）
 
@@ -156,9 +239,10 @@ app/
   db.py         # SQLite 连接、建表、修订号元数据
   linkcheck.py  # href 解析（相对/绝对/#片段/查询串/越界）与整批链接校验
   publish.py    # 单写事务：试用整批改动 -> 校验 -> 提交；冲突/校验错误
+  merge.py      # 单写事务：基线/当前快照三方比对 -> 合入 -> 校验 -> 新修订
   relocate.py   # 单写事务：页面搬迁、站内 href 改写（沿用 linkcheck）、整包校验、新修订
-  main.py       # FastAPI 路由与请求模型（/publish 与 /relocate）
-tests/          # pytest 端到端 + 链接解析/搬迁改写单测
+  main.py       # FastAPI 路由与请求模型（/publish、/merge 与 /relocate）
+tests/          # pytest 端到端 + 链接解析/搬迁改写/并行合入单测
 Dockerfile
 docker-compose.yml
 entrypoint.sh   # 启动时初始化数据库再拉起 uvicorn

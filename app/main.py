@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from . import db
+from .merge import BaselineNotFound, MergeConflict, merge
 from .publish import PublishConflict, PublishValidationError, publish
 from .relocate import relocate
 
@@ -64,6 +65,13 @@ class Change(BaseModel):
 
 class PublishRequest(BaseModel):
     expected_revision: int = Field(ge=0, description="客户端预期的当前修订号，实现乐观锁")
+    changes: list[Change] = Field(default_factory=list)
+
+
+class MergeRequest(BaseModel):
+    """并行合入：基于历史基线修订的整批变更，三方比对后合入当前快照。"""
+
+    base_revision: int = Field(ge=0, description="客户端改动所基于的历史修订号（基线）")
     changes: list[Change] = Field(default_factory=list)
 
 
@@ -137,6 +145,49 @@ def publish_endpoint(req: PublishRequest):
                 "detail": "revision conflict",
                 "expected": req.expected_revision,
                 "current": exc.current_revision,
+            },
+        )
+    except PublishValidationError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "validation failed", "errors": exc.errors},
+        )
+    finally:
+        conn.close()
+
+
+@app.post("/merge")
+def merge_endpoint(req: MergeRequest):
+    """把基于历史基线修订的整批变更合入当前快照。
+
+    比对、校验与提交在同一个 SQLite 写事务内完成：涉及路径与当前快照有
+    并行改动时返回 409 与冲突路径；最终链接校验失败返回 422 并列出
+    来源与错误目标；全部通过才生成一个新修订。
+    """
+    conn = db.connect()
+    try:
+        new_revision = merge(
+            conn,
+            base_revision=req.base_revision,
+            changes=[c.model_dump() for c in req.changes],
+        )
+        return {"revision": new_revision, "merged": True}
+    except BaselineNotFound as exc:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "detail": "base revision not found",
+                "base_revision": exc.base_revision,
+            },
+        )
+    except MergeConflict as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": "merge conflict",
+                "base_revision": req.base_revision,
+                "current": exc.current_revision,
+                "conflicts": exc.conflicts,
             },
         )
     except PublishValidationError as exc:
